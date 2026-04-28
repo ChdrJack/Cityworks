@@ -1,0 +1,265 @@
+###Date
+
+# Get the current system time
+$Time = Get-Date
+# Convert the time to Central Standard Time (CST)
+$CSTTime = $Time.ToUniversalTime().AddHours(-5)
+
+# Subtract 72 hours.
+$m2Time = $CSTTime.AddHours(-72)
+
+# Create time string for Cityworks
+$CWDate = Get-Date $m2Time -Format 'yyyy-MM-ddTHH:mm:ssZ'
+$CWDate
+
+# Create time string for Central Square
+$CSDate = Get-Date $m2Time -Format 'yyyyMMdd'
+$CSDate
+
+#
+
+$ErrorActionPreference = 'silentlycontinue'
+
+#Escape characters
+function Set-EscapeCharacters {
+    Param(
+        [parameter(Mandatory = $true, Position = 0)]
+        [String]
+        $string
+    )
+    $string = $string -replace "'", "\'"
+    $string = $string -replace "&", "and"
+    $string = $string -replace "#", ""
+    $string
+}
+
+#Centralsquare ODBC meter data
+function Get-ODBC-Meter{
+   param(
+   [string]$query="SELECT * FROM UTSYNCAP WHERE UTMTR=$CSMeterNBR",
+   [string]$dsn = "hostname.domain.com"
+   )
+   $conn = New-Object System.Data.Odbc.OdbcConnection
+   $conn.ConnectionString = "DSN=$dsn;UID=;PWD="
+   $conn.open()
+   #$conn
+   $cmd = New-object System.Data.Odbc.OdbcCommand($query,$conn)
+   $ds = New-Object system.Data.DataSet
+   (New-Object system.Data.odbc.odbcDataAdapter($cmd)).fill($ds) | out-null
+   $conn.close()
+  
+   $ds.Tables[0]
+   #$conn
+}
+
+
+#Set base URL for cityworks
+[string]$BaseURL = "https://hostname.domain.com/cityworks"
+
+#Cityworks authentication
+$CWTValue = Invoke-RestMethod -Uri "$BaseURL/services/General/Authentication/Authenticate?data={'LoginName':'','Password':''}"| Select-Object -ExpandProperty Value
+$CWToken = echo $CWTValue|Select-Object -ExpandProperty Token
+
+  #Centralsquare Authentication - JobOrderSync
+    $paramspull = @{
+        Uri = "https://hostname.domain.com/FusionServices/v3/Naviline/WorkOrders/JobOrderSync"
+        Headers = @{"X-APPID" = ""; "X-APPKEY" = ""}
+        Method = "POST"
+        ContentType = "application/x-www-form-urlencoded"
+        Body = @{"SYNCTYPE" = "F";"REQCATG" = "CS-METER READER"; "WRREQDTE" = "$CSDate"}
+    }
+
+   #Centralsquare Authentication - TaskInfo
+    $tasksparams = @{
+        Uri = "https://hostname.domain.com/FusionServices/v3/Naviline/WorkOrders/TaskInfo"
+        Headers = @{"X-APPID" = ""; "X-APPKEY" = ""}
+        Method = "GET"
+        ContentType = "application/json"
+    }
+    
+    #try {
+        #Connect to Centralsquare
+        $WoPull = Invoke-RestMethod @paramspull
+        
+        # Output
+        Write-Host "Transferring Work Orders"
+        #Pull where catg = Read and WR date is greater than $CSdate
+        #Pull specific fields with select
+        $WOResults = $WOPull.Rows|Where-Object {($_.CATG -eq "READ") -and ($_.WRREQDTE -ge "$CSDate")}|Select "REQUESTNBR","WRREQDTE","WRSCHSTRDTE","SHORTDSC","REQSTATUS","CUSTOMERID","LOCATIONID","TASK","METERNBR","REQNAME","SERVICE"
+        
+        #Process each result
+        foreach ($CSCWO in $WOResults){
+
+            
+            #Centralsquare address lookup
+                $CSCustID = $CSCWO|select -ExpandProperty "CUSTOMERID"
+                $CSLocationID = $CSCWO|select -ExpandProperty "LOCATIONID"
+                $CSAddressURI = "https://hostname.domain.com/FusionServices/v2/Naviline/Utilities/$CSCustID/$CSLocationID/address"
+                #$CSAddressURI
+                $CSAddressPull = Invoke-RestMethod -URI $CSAddressURI -Headers @{"X-APPID" = ""; "X-APPKEY" = ""}|Select-Object -ExpandProperty OutputParms
+            
+            #Define variables for Cityworks work order creation
+                $CSAddress = Set-EscapeCharacters $CSAddressPull.LocationAddress
+                $CSCustomerName = Set-EscapeCharacters $CSAddressPull.CustomerName
+                $CSWFNumber = $CSCWO|select -ExpandProperty "REQUESTNBR"
+                $CSWRReqDate = $CSCWO|select -ExpandProperty "WRREQDTE"
+                $CSWWRSchSrtDate = $CSCWO| select -ExpandProperty "WRSCHSTRDTE" 
+                $CSShortDsc = $CSCWO |select -ExpandProperty "SHORTDSC"
+                $CSReqStatus = $CSCWO|select -ExpandProperty "REQSTATUS"
+                $CSCustID = $CSCWO|select -ExpandProperty "CUSTOMERID"
+                $CSLocationID = $CSCWO|select -ExpandProperty "LOCATIONID"
+                $CSTask = $CSCWO|select -ExpandProperty "TASK"
+                $CSMeterNBR = $CSCWO|select -ExpandProperty "METERNBR"
+                $CSReqName = $CSCWO|select -ExpandProperty "REQNAME"
+                $CSServiceCode = $CSCWO|select -ExpandProperty "SERVICE"
+
+                [string]$CSAccountNumber = "$CSCustID-$CSLocationID"
+                $CSMeterCycleRoute = Get-ODBC-Meter|Select-Object -ExpandProperty CYCRTE
+                $CSMeterInfo = Get-ODBC-Meter|Select-Object -ExpandProperty MTR_TYPE
+                $CSMeterCycle = $CSMeterCycleRoute.Substring(0, [Math]::Min($CSMeterCycleRoute.Length, 2))
+                $CSMeterRoute = $CSMeterCycleRoute.Substring(2,2)
+                $CSMeterType = $CSMeterInfo.Substring(0, [Math]::Min($CSMeterInfo.Length, 2))
+                $CSMeterSize = $CSMeterInfo.Substring(2,3)
+            #Get the original task desc from Central Square
+                $WOTypes = Invoke-RestMethod @tasksparams
+                $CSTASKDESC = $WOTypes.Rows|Where-Object {$_.CATGDESC -eq "CS-METER READER"}|Select "TASKDESC","TASK"|Where-object {$_.TASK -eq $CSTASK}|Select-Object -ExpandProperty "TASKDESC"
+            
+            #Centralsquare comments
+                $CSCommentURI = "https://hostname.domain.com/FusionServices/v3/Naviline/WorkOrders/WorkRequestComments/$CSWFNumber/D"
+                
+                $CSComments = Invoke-RestMethod -URI $CSCommentURI -Headers @{"X-APPID" = ""; "X-APPKEY" = ""}|Select-Object -ExpandProperty Rows|Select-Object -ExpandProperty COMMENTTXT
+                
+                $CSComment = Set-EscapeCharacters $CSComments 
+            
+            #Get Centralsquare meter information
+                #Get billing date
+                $CSMeterBillDateAllConnect = Invoke-restmethod -method Get -Uri "https://hostname.domain.com/usionServices/v2/Naviline/Utilities/$CSCustID/$CSLocationID/billing" -Headers @{"X-APPID" = ""; "X-APPKEY" = ""}
+                $CSBilldateCurrent = $CSMeterBillDateAllConnect.Rows|Select-Object -ExpandProperty BillDate -First 1
+                $CSServiceCodeDate = [DateTime]::ParseExact($CSBilldateCurrent, "MMddyyyy", $null)
+                $CSBillDate = $CSServiceCodeDate.ToString("yyMMdd")
+                
+               
+                #Get service code IE: WA
+                $CSServiceCodeConnect = Invoke-restmethod -method Get -Uri "https://hostname.domain.com/FusionServices/v2/Naviline/Utilities/$CSCustID/$CSLocationID/billing/$CSBillDate/charges" -Headers @{"X-APPID" = ""; "X-APPKEY" = ""}
+                $CSServiceCodeMeter = $CSServiceCodeConnect.Rows|Select-Object -ExpandProperty ServiceCode
+                $CSReadDate = $CSServiceCodeConnect.Rows|Select-Object -ExpandProperty ReadDate
+                $CSChargeMeterNumber = $CSServiceCodeConnect.Rows|Select-Object -ExpandProperty MeterNumber
+                $CSTotalConsumption = $CSServiceCodeConnect.Rows|Select-Object -ExpandProperty TotalActualConsumption
+                $CSTotalDemandConsumption = $CSServiceCodeConnect.Rows|Select-Object -ExpandProperty TotalDemandConsumption
+                #Get usage information
+                $CSMeterUsage = Invoke-restmethod -method Get -Uri "https://hostname.domain.com/FusionServices/v2/Naviline/Utilities/$CSCustID/$CSLocationID/service/$CSServiceCode/meter" -Headers @{"X-APPID" = ""; "X-APPKEY" = ""}
+                #Meter Sequence number
+                $CSMeterSequencenumber = $CSMeterUsage.Rows|Select-Object -ExpandProperty Sequence
+                #Returns Meter Read Date in Cityworks DateTime format
+                $CSMTRReadDate = $CSMeterUsage.Rows|Select-Object -ExpandProperty LastReadDate
+                $CWMTRReadDate2 = [DateTime]::ParseExact($CSMTRReadDate, "MMddyyyy", $null)
+                $CWMTRReadDate3 = $CWMTRReadDate2.AddHours(+5)
+                $CWMTRReadDateCST = $CWMTRReadDate3.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+                #Format Central Square Request Date in Cityworks
+                $CSRequestDate = $CSWRReqDate
+                $CSRequestDate2 = [datetime]::ParseExact($CSRequestDate,"yyyyMMdd",$null)
+                $CSRequestDate3 = $CSRequestDate2.AddHours(+5)
+                $CWRequestDateCST = $CSRequestDate3.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+                #Format Central Square Scheduled Start Date in Cityworks
+                $CSScheduleStartDate = $CSWWRSchSrtDate
+                $CSScheduleStartDate2 = [datetime]::ParseExact($CSScheduleStartDate,"yyyyMMdd",$null)
+                $CSScheduleStartDate3 = $CSScheduleStartDate2.AddHours(+5)
+                $CWScheduleStartDateCST = $CSScheduleStartDate3.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    #SQL TemplateID's - get Template ID's from Cityworks through SQL
+                Import-Module sqlserver
+
+            #Query first 1000 results         Template ID               TemplateID  Description        Database                          Sort Results                    
+                $Query = "SELECT TOP (1000) CAST([WOTEMPLATEID] AS INT) AS [WOTEMPINT],[DESCRIPTION] FROM [Cityworks].[azteca].[WOTEMPLATE] ORDER BY [WOTEMPINT]"
+            
+            #Run the SQL query                                             Hostname         Database   Ignore certificate errors
+                $CWTemplateIDs = Invoke-Sqlcmd -Query "$Query" -ServerInstance hostname -Database database -TrustServerCertificate
+            
+
+            #Get template ID's              Match result Description with Centralsquare and return Template ID number        
+                #$CWTemplateID = $CWTemplateIDs|Where-Object  DESCRIPTION -eq "$CSShortDsc"|Select-Object -ExpandProperty "WOTEMPINT"
+                $CWTemplateID = $CWTemplateIDs|Where-Object  DESCRIPTION -eq "$CSTASKDESC"|Select-Object -ExpandProperty "WOTEMPINT"
+            
+            
+            #Check to see if it is okay to create work order
+                $CSWOURI = "$BaseURL/services/Ams/WorkOrder/Search?data={Text1:['$CSWFNumber']}&token=$CWToken"
+                $CWWFNumber = Invoke-RestMethod -Uri $CSWOURI -Method Get|Select-Object -ExpandProperty Value
+                #Start-Sleep -Seconds 2
+            #Check if WF exists in Cityworks    
+                if($CWWFNumber -eq $null){
+            #Make sure Template ID exists in Cityworks        
+                    if($CWTemplateID -ne $null){
+                        Write-Host "Creating Cityworks Work Order with TemplateID $CWTemplateID"
+                        #Print results to console
+                        Write-Host `n
+                        $CSCustomerName
+                        $CSAddress 
+                        $CSWFNumber
+                        $CSWRReqDate
+                        $CSShortDsc
+                        $CSReqStatus
+                        $CSCustID
+                        $CSLocationID
+                        $CSTask
+                        $CSMeterNBR
+                        $CSReqName
+                        $CSBillDate
+                        $CSServiceCode
+                        $CSServiceCodeMeter
+                        $CSReadDate
+                        $CSChargeMeterNumber
+                        $CSTotalConsumption
+                        $CSTotalDemandConsumption
+                        $CSMeterUsage.Rows
+                        $CWMTRReadDateCST
+                        $CWRequestDateCST
+                        $CSComment
+                        $CSMeterCycleRoute
+                        $CSMeterCycle
+                        $CSMeterRoute
+                        $CSMeterType
+                        $CSMeterSize
+                #Actually create workorder         
+                        $CWCreateWOURI = "$BaseURL/services/Ams/WorkOrder/Create?data={'EntityType':'WATERMETERS','WOTemplateId':'$CWTemplateID','SupervisorSID':'57','SubmitToSid':'4553','Address':'$CSAddress','Location':'$CSAddress','RequestedBySid':'4377','GeocodeAddress':'True','Instructions':'Task:$CSTask Description:$CSShortDsc Requester:$CSReqName','Text1':'$CSWFNumber','Date1':'$CWRequestDateCST','ProjectedStartDate':'$CWScheduleStartDateCST','WOCustFieldCatId':'22','CustomFieldValues':{'158':'$CSMeterNBR','161':'$CSServiceCode','162':'$CWMTRReadDateCST','163':'$CSTotalConsumption','164':'$CSTotalDemandConsumption','157':'$CSAccountNumber','156':'$CSCustomerName','165':'$CSMeterCycle','166':'$CSMeterRoute','159':'$CSMeterType','160':'$CSMeterSize'}}&Token=$CWToken"
+                        Invoke-RestMethod -Uri $CWCreateWOURI -Method Post 
+                        
+                        #Get Work Cityworks Work order by Centralsquare work order
+                        $CSWOURI = "$BaseURL/services/Ams/WorkOrder/Search?data={Text1:['$CSWFNumber']}&token=$CWToken"
+                        $CWWOID = Invoke-RestMethod -Uri $CSWOURI -Method Get|Select-Object -ExpandProperty Value
+                       
+                       #Check for Cityworks Work Order 
+                       if($CWWOID -ne $null){
+
+                        #Centralsquare comment to Cityworks comment
+                       if($CSComment -ne $null){
+                        Write-Host "Commenting $CSComment"
+                        $CWComment = "$BaseURL/services/Ams/WorkOrder/AddComments?data={'WorkOrderId':'$CWWOID','WorkOrderSid':'$CWWOID','Comments':'$CSComment'}&Token=$CWToken"
+                        Invoke-RestMethod -Uri $CWComment -Method Post
+                        $CScomment = $null
+                        }
+                        # Add Entities to Cityworks
+                        
+                        $CWENTURI = "$BaseURL/services/Ams/Entity/Search?data={'EntityType':'WATERMETERS'}&Token=$CWToken"    
+                        $CWMeterinfo = Invoke-RestMethod -Uri $CWENTURI|Select-Object -ExpandProperty Value|Select-Object -ExpandProperty Records|Select-Object -ExpandProperty Attributes|Where-Object -Property NewMeterNu -eq "$CSMeterNBR" #LocID -eq "$CSLocationID"
+                        $CWNewMeterNum = $CWMeterinfo.NewMeterNu
+                        Write-Host "Meter $CWNewMeterNum"
+                        Write-Host "Adding meter to work order $CWWOID"
+                        $CWAddEntityUri = "$BaseURL/services/Ams/WorkOrder/AddEntities?data={'WorkOrderId':'$CWWOID','WorkOrderSid':'$CWWOID','EntityUids':['$CWNewMeterNum'],'EntityType':'WATERMETERS'}&Token=$CWToken"
+                        Invoke-RestMethod -Uri $CWAddEntityUri -Method Post
+                        <#$CWMeterAddress = $CWMeterinfo.MeterAddre 
+                        $CWMeterAddress#>
+                                            
+                        }                                             
+                        }
+                else {
+                Write-Host "Skipping $CSTASKDESC, does not have a Template ID in Cityworks"
+                }
+            #Set Template ID to null for next loop
+            $CWTemplateID = $null
+            }
+            else {
+                Write-Host "Skipping $CSWFNumber, already exists"
+                }
+    }
